@@ -1,0 +1,7 @@
+pdfplumber
+pypdfium2
+Pillow
+httpx
+openai
+pyautogui
+opencv-python
