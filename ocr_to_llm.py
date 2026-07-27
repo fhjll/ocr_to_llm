@@ -335,7 +335,7 @@ def refund(fields):
     a.press("enter")
     a.sleep(1)
 
-    find_pic("./imgs/tk4.png")#4.png
+    find_pic("./imgs/tk4.png", confidence=0.8)#4.png
     a.sleep(1)
     find_pic("./imgs/tk3.png")#3.png
     a.sleep(0.5)	
@@ -346,7 +346,7 @@ def refund(fields):
     a.press("tab")
     a.sleep(0.5)
             
-    find_pic("./imgs/tk4.png")#4.png
+    find_pic("./imgs/tk4.png", confidence=0.8)#4.png
     a.sleep(0.5)	
     a.press("enter")
     
@@ -534,13 +534,18 @@ def main():
 
 
 
-def find_pic(img):
+def find_pic(img, confidence=0.9, timeout=60):
+    """在屏幕上定位图片并点击; 超时抛异常而不是无限等待"""
+    import time
+    deadline = time.time() + timeout
     while True:
-        if  a.locateCenterOnScreen(img,confidence =0.9) is None:
-            a.sleep(0.5)
-        else:
-            a.click(a.locateCenterOnScreen(img,confidence =0.9))
-            break
+        pos = a.locateCenterOnScreen(img, confidence=confidence, grayscale=True)
+        if pos is not None:
+            a.click(pos)
+            return
+        if time.time() > deadline:
+            raise TimeoutError(f"超时未找到图片: {img}")
+        a.sleep(0.5)
 def process_single_file(path):
     result = llm_ocr(path)
     if not result:
