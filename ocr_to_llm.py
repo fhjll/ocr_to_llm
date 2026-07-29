@@ -14,9 +14,46 @@ import json
 import os
 import re
 import sys
+import multiprocessing
 
-import pyautogui as a 
-import httpx
+# =========================
+# PyInstaller 资源路径兼容
+# =========================
+
+def get_base_dir() -> str:
+    """获取程序运行时的基础目录（兼容 PyInstaller 打包）"""
+    if getattr(sys, 'frozen', False):
+        # PyInstaller 打包后，使用 exe 所在目录
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def get_resource_path(relative_path: str) -> str:
+    """获取资源文件的绝对路径（兼容 PyInstaller --onedir 打包）"""
+    if getattr(sys, 'frozen', False):
+        # --onedir 模式: 资源在 exe 同级目录
+        base = os.path.dirname(sys.executable)
+    else:
+        base = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, relative_path)
+
+
+# 延迟导入 pyautogui，避免导入失败时 GUI 无法启动
+_pyautogui = None
+
+def get_pyautogui():
+    """延迟加载 pyautogui，失败时给出明确提示"""
+    global _pyautogui
+    if _pyautogui is None:
+        try:
+            import pyautogui
+            _pyautogui = pyautogui
+        except ImportError as e:
+            raise ImportError(
+                f"pyautogui 导入失败: {e}\n"
+                "请确认已安装: pip install pyautogui opencv-python"
+            )
+    return _pyautogui
 # =========================
 # 配置区（请先填写实际值）
 # =========================
@@ -37,7 +74,7 @@ OCR_LANG = "ch"
 # 外部配置（config.json）
 # =========================
 
-CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+CONFIG_PATH = os.path.join(get_base_dir(), "config.json")
 
 # 默认配置: config.json 不存在时自动写入该默认值, 用户可直接编辑 json 文件
 DEFAULT_CONFIG = {
@@ -189,37 +226,37 @@ def extract_fields(text: str) -> dict:
 # 3. 大模型业务分类
 # =========================
 
-SYSTEM_PROMPT = """你是一名财政业务办理员，根据以下规则判断业务类型（按顺序严格执行）：
+SYSTEM_PROMPT = """你是一名财政业务复核员。业务类型已按关键字规则自动判定，你的职责是复核该判定是否合理。
 
-规则 1（前置检查）：
-- 检查「收款人账户名称」是否以「地方财政库款」结尾，或为「xxx财政局xxx资金专户」格式
-- 不符合 → business_type = "illegal"
+规则原文：
+- 规则1：「收款人账户名称」以「地方财政库款」结尾，或为「xxx财政局xxx资金专户」格式，否则为 illegal
+- 规则2：「付款人账户名称」含「清算」「授权支付」「零余额」「待转」任意一词（条件A），且「附言」含「退款」「退回」「清算」「授权支付」任意一词（条件B），两者同时满足为 settlement_refund，否则为 external_allocation
 
-规则 2（类型细分）：
-若符合规则 1，则：
-- 检查「付款人账户名称」是否包含「清算」「授权支付」「零余额」「待转」中任意一词
-- 且「附言」是否包含「退款」「退回」「清算」「授权支付」中任意一词
-- 两者同时满足 → business_type = "settlement_refund"
-- 否则 → business_type = "external_allocation"，并在 reason 字段输出「收款人账户：xxx，付款人账户：xxx，附言：xxx」
+复核要求：
+- 逐条核对规则1、条件A、条件B，判断规则判定结果是否正确
+- 注意 OCR 可能有个别错别字，结合语义理解账户名称和附言
+- 判定正确 → agree = true；判定错误 → agree = false，并在 reason 说明你认为的正确类型和依据
 
 输出严格遵循 JSON 格式（不要包含任何其他内容）：
-{"business_type": "illegal | settlement_refund | external_allocation", "reason": "..."}"""
+{"agree": true | false, "reason": "..."}"""
 
 
-def build_prompt(fields: dict) -> str:
+def build_prompt(fields: dict, rule_result: dict) -> str:
     lines = [
         f"付款人账户名称：{fields.get('付款人账户名称', '（未识别）')}",
         f"收款人账户名称：{fields.get('收款人账户名称', '（未识别）')}",
         f"附言：{fields.get('附言', '（未识别）')}",
+        f"规则判定结果：{rule_result.get('business_type')}（{rule_result.get('reason', '')}）",
     ]
     return "\n".join(lines)
 
 
 def call_deepseek(prompt_text: str) -> str:
+    import httpx
     from openai import OpenAI
     
     http_client = httpx.Client(proxy=None)
-    client = OpenAI(api_key=API_KEY, base_url=API_BASE_URL,http_client=http_client)
+    client = OpenAI(api_key=API_KEY, base_url=API_BASE_URL, http_client=http_client)
     resp = client.chat.completions.create(
         model=MODEL_NAME,
         messages=[
@@ -233,28 +270,47 @@ def call_deepseek(prompt_text: str) -> str:
 
 
 
-def classify_by_llm(fields: dict) -> dict:
-    """调用远程大模型进行业务分类，返回 {"business_type": ..., "reason": ...}"""
-    prompt_text = build_prompt(fields)
+def classify_by_rules(fields: dict) -> dict:
+    """按关键字规则确定性分类，返回 {"business_type": ..., "reason": ...}"""
+    payee = fields.get("收款人账户名称", "")
+    payer = fields.get("付款人账户名称", "")
+    remark = fields.get("附言", "")
 
-    if MODEL_ENABLED:
-        result_text = call_deepseek(prompt_text)
-   
-    else:
-        return {"business_type": "unknown", "reason": "未启用任何大模型"}
+    # 规则 1：收款人必须是财政库款/财政专户
+    if not (payee.endswith("地方财政库款") or ("财政局" in payee and "资金专户" in payee)):
+        return {"business_type": "illegal",
+                "reason": f"收款人账户不符合财政库款/专户格式：{payee}"}
 
-    # 尝试解析 JSON
+    # 规则 2：条件A、条件B 同时满足才算清算退款
+    cond_a = any(k in payer for k in ("清算", "授权支付", "零余额", "待转"))
+    cond_b = any(k in remark for k in ("退款", "退回", "清算", "授权支付"))
+    if cond_a and cond_b:
+        return {"business_type": "settlement_refund",
+                "reason": "付款人含清算类关键词且附言含退款类关键词"}
+    return {"business_type": "external_allocation",
+            "reason": f"收款人账户：{payee}，付款人账户：{payer}，附言：{remark}"}
+
+
+def review_by_llm(fields: dict, rule_result: dict) -> dict:
+    """AI 复核规则分类结果，返回 {"agree": bool, "reason": ...}；复核不可用时视为通过"""
+    if not MODEL_ENABLED:
+        return {"agree": True, "reason": "未启用大模型，跳过复核"}
     try:
-        return json.loads(result_text)
+        result_text = call_deepseek(build_prompt(fields, rule_result))
+    except Exception as e:
+        return {"agree": True, "reason": f"复核调用失败，按规则结果执行: {e}"}
+    try:
+        result = json.loads(result_text)
     except json.JSONDecodeError:
-        # 模型没输出纯 JSON，尝试从中提取 JSON 片段
         m = re.search(r"\{[^{}]*\}", result_text)
         if m:
             try:
-                return json.loads(m.group())
+                result = json.loads(m.group())
             except json.JSONDecodeError:
-                pass
-        return {"business_type": "parse_error", "reason": f"模型返回非JSON: {result_text[:200]}"}
+                result = None
+        if result is None:
+            return {"agree": True, "reason": f"复核返回非JSON，按规则结果执行: {result_text[:200]}"}
+    return {"agree": bool(result.get("agree", True)), "reason": result.get("reason", "")}
 
 
 # =========================
@@ -301,11 +357,16 @@ def llm_ocr(pdf_path):
         
         fields = extract_fields(data)
        
-        result = classify_by_llm(fields)
-        biz_type = result.get("business_type", "unknown")
-        reason = result.get("reason", "")
+        rule_result = classify_by_rules(fields)
+        review = review_by_llm(fields, rule_result)
+        biz_type = rule_result["business_type"]
+        if not review["agree"]:
+            biz_type = "needs_review"
+            print(f"  ⚠ AI 复核不通过，转人工: {review['reason']}")
         
-        classify_result.append({"biz":biz_type,"fields":fields})
+        classify_result.append({"biz": biz_type, "fields": fields,
+                                "reason": rule_result.get("reason", ""),
+                                "review": review.get("reason", "")})
     print(classify_result)
     return classify_result
 # =========================
@@ -314,8 +375,9 @@ def llm_ocr(pdf_path):
 ## 清算退
 def refund(fields):
 ## 清算退款
+    a = get_pyautogui()
     a.sleep(1)
-    find_pic("./imgs/tk1.png")#1.png
+    find_pic(get_resource_path("imgs/tk1.png"))#1.png
     
     a.sleep(1)
     a.press('down',8)
@@ -324,7 +386,7 @@ def refund(fields):
     a.press('enter',2)
     a.sleep(1)
     
-    find_pic("./imgs/tk2.png")#2.png
+    find_pic(get_resource_path("imgs/tk2.png"))#2.png
     a.sleep(1)
         
     a.press("tab",10)
@@ -335,9 +397,9 @@ def refund(fields):
     a.press("enter")
     a.sleep(1)
 
-    find_pic("./imgs/tk4.png", confidence=0.8)#4.png
+    find_pic(get_resource_path("imgs/tk4.png"), confidence=0.8)#4.png
     a.sleep(1)
-    find_pic("./imgs/tk3.png")#3.png
+    find_pic(get_resource_path("imgs/tk3.png"))#3.png
     a.sleep(0.5)	
     a.press("enter")
     a.sleep(0.5)
@@ -346,7 +408,7 @@ def refund(fields):
     a.press("tab")
     a.sleep(0.5)
             
-    find_pic("./imgs/tk4.png", confidence=0.8)#4.png
+    find_pic(get_resource_path("imgs/tk4.png"), confidence=0.8)#4.png
     a.sleep(0.5)	
     a.press("enter")
     
@@ -378,21 +440,22 @@ def refund(fields):
 ##系统外调拨
 def external(fields):
     ##系统外调拨
+    a = get_pyautogui()
 
     a.sleep(1)
-    find_pic("./imgs/sr1.png")#5.png
+    find_pic(get_resource_path("imgs/sr1.png"))#5.png
     a.sleep(0.5)
     a.press('down',2)
     a.sleep(1)
     a.press('enter',2)
     a.sleep(1)
-    find_pic("./imgs/sr2.png")	#6.png
+    find_pic(get_resource_path("imgs/sr2.png"))	#6.png
     a.sleep(0.5)
     
     a.sleep(1)
     a.press("tab")
     a.sleep(1)
-    a.write(fields["交易流水号后三位"])
+    a.write(fields["流水号后三位"])
     a.press("enter")
     a.sleep(1)
     a.write(fields["交易流水号"])
@@ -405,7 +468,7 @@ def external(fields):
     
     
 
-    a.write(fields["交易流水号后三位"])
+    a.write(fields["流水号后三位"])
     a.press("enter")
     a.sleep(1)
     a.write(fields["受理日期"])
@@ -426,28 +489,7 @@ def external(fields):
         
     a.sleep(2)   
     a.press("enter")      
-    a.write(fields["收款人账号"])   
-    # if "271001" in skzh[i]:
-        # a.write('171500000003271001',interval=0.1)
-    # elif "271003" in skzh[i]:
-        # a.write('171500000003271003',interval=0.1)
-    
-    # elif "271013" in skzh[i]:
-        # a.write('171500000003271013',interval=0.1)
-    
-    # elif "271014" in skzh[i]:
-        # a.write('171500000003271014',interval=0.1)
-    
-    # elif "271015" in skzh[i]:
-        # a.write('171500000003271015',interval=0.1)
-    
-    # elif "271016" in skzh[i]:
-        # a.write('171500000003271016',interval=0.1)
-    
-    # else:
-        # a.write('171500000003271017',interval=0.1)
-        
-
+    a.write(fields.get("收款人账号", ""))   
     
     a.sleep(0.5)
     a.press("enter")
@@ -515,17 +557,18 @@ def main():
     for k, v in fields.items():
         print(f"  {k}: {v}")
 
-    print("[3/4] 调用大模型进行业务分类 ...")
-    try:
-        result = classify_by_llm(fields)
-        biz_type = result.get("business_type", "unknown")
-        reason = result.get("reason", "")
-        print(f"  业务类型: {biz_type}")
-        print(f"  原因: {reason}")
-    except Exception as e:
-        print(f"  ❌ 大模型调用失败: {e}")
-        print("  ⚠ 请检查脚本开头的配置区是否正确填写（API Key、服务器地址等）")
-        return
+    print("[3/4] 规则分类 + AI 复核 ...")
+    result = classify_by_rules(fields)
+    biz_type = result.get("business_type", "unknown")
+    reason = result.get("reason", "")
+    print(f"  业务类型: {biz_type}")
+    print(f"  原因: {reason}")
+    review = review_by_llm(fields, result)
+    if not review["agree"]:
+        biz_type = "needs_review"
+        print(f"  ⚠ AI 复核不通过: {review['reason']}")
+    else:
+        print(f"  AI 复核: 通过（{review['reason']}）")
 
     print("[4/4] 输出结果 ...")
     print("\n" + "=" * 50)
@@ -537,6 +580,7 @@ def main():
 def find_pic(img, confidence=0.9, timeout=60):
     """在屏幕上定位图片并点击; 超时抛异常而不是无限等待"""
     import time
+    a = get_pyautogui()
     deadline = time.time() + timeout
     while True:
         pos = a.locateCenterOnScreen(img, confidence=confidence, grayscale=True)
@@ -557,6 +601,10 @@ def process_single_file(path):
             refund(fields)
         elif biz == "external_allocation":
             external(fields)
+        elif biz == "needs_review":
+            print(f"  ⚠ 跳过自动录入，待人工复核: 流水号 {fields.get('交易流水号', '?')} "
+                  f"金额 {fields.get('金额', '?')} 复核意见: {data.get('review', '')}")
+            continue
         else:
             break
 
@@ -639,9 +687,25 @@ def run_gui():
 
 
 if __name__ == "__main__":
-    if len(sys.argv) >= 2:
-        # 命令行模式: python ocr_to_llm.py <PDF文件路径>
-        main()
-    else:
-        run_gui()
+    # PyInstaller 在 Windows 上需要 freeze_support 防止子进程重复启动
+    multiprocessing.freeze_support()
+
+    try:
+        if len(sys.argv) >= 2:
+            # 命令行模式: python ocr_to_llm.py <PDF文件路径>
+            main()
+        else:
+            run_gui()
+    except Exception as e:
+        # 在 --windowed 模式下捕获异常并弹窗提示，避免静默崩溃
+        try:
+            import tkinter as tk
+            from tkinter import messagebox
+            root = tk.Tk()
+            root.withdraw()
+            messagebox.showerror("程序启动失败", f"错误信息:\n{e}\n\n请检查依赖是否完整安装。")
+            root.destroy()
+        except Exception:
+            pass
+        sys.exit(1)
 

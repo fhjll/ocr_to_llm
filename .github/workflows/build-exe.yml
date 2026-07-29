@@ -1,4 +1,4 @@
-name: Build Windows EXE
+name: Build Windows EXE (Win7 x86 + x64)
 
 on:
   push:
@@ -8,13 +8,17 @@ on:
 jobs:
   build:
     runs-on: windows-2019
+    strategy:
+      matrix:
+        arch: [x64, x86]
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python 3.8
+      - name: Set up Python 3.8 (${{ matrix.arch }})
         uses: actions/setup-python@v5
         with:
           python-version: "3.8"
+          architecture: ${{ matrix.arch }}
           cache: pip
 
       - name: Install dependencies
@@ -25,10 +29,10 @@ jobs:
 
       - name: Build EXE
         run: |
-          pyinstaller --onedir --windowed --name 凭证批量处理 --add-data "imgs;imgs" --add-data "config.json;." ocr_to_llm.py
+          pyinstaller --onedir --windowed --name 凭证批量处理 --add-data "imgs;imgs" --add-data "config.json;." --hidden-import pymsgbox --hidden-import pyscreeze --hidden-import pygetwindow --hidden-import mouseinfo --hidden-import cv2 --collect-submodules pyautogui ocr_to_llm.py
 
-      - name: Upload artifact
+      - name: Upload artifact (${{ matrix.arch }})
         uses: actions/upload-artifact@v4
         with:
-          name: VoucherProcessor-win7-x64
+          name: VoucherProcessor-win7-${{ matrix.arch }}
           path: dist/凭证批量处理/
